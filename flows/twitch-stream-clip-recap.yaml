@@ -1,0 +1,356 @@
+id: twitch-stream-clip-recap
+namespace: company.team
+
+inputs:
+  - id: broadcaster_login
+    type: STRING
+    defaults: summit1g
+    description: Twitch login of the channel to recap, as it appears in twitch.tv/<login>.
+
+  - id: mode
+    type: SELECT
+    values: [RECAP, WATCH]
+    defaults: RECAP
+    description: RECAP recaps the latest broadcast now. WATCH, used by the schedule, only recaps once a tracked live session has gone offline.
+
+  - id: lookback_hours
+    type: INT
+    defaults: 24
+    description: A past broadcast is only recapped if it started within this many hours. For channels that keep no VODs, this is also the clip window.
+
+  - id: clip_count
+    type: INT
+    defaults: 3
+    description: Maximum number of moments in the recap.
+
+variables:
+  helix: https://api.twitch.tv/helix
+  ollama_endpoint: http://host.docker.internal:11434
+  ollama_model: ministral-3:14b
+
+tasks:
+  - id: auth
+    type: io.kestra.plugin.core.http.Request
+    description: Mints an app access token with the client-credentials grant. It is revoked in the finally block.
+    uri: https://id.twitch.tv/oauth2/token
+    method: POST
+    contentType: application/x-www-form-urlencoded
+    formData:
+      client_id: "{{ secret('TWITCH_CLIENT_ID') }}"
+      client_secret: "{{ secret('TWITCH_CLIENT_SECRET') }}"
+      grant_type: client_credentials
+
+  - id: user
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ vars.helix }}/users?login={{ inputs.broadcaster_login }}"
+    headers:
+      Client-Id: "{{ secret('TWITCH_CLIENT_ID') }}"
+      Authorization: "Bearer {{ outputs.auth.body | jq('.access_token') | first }}"
+
+  - id: check_user
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ (outputs.user.body | jq('.data | length') | first) == 0 }}"
+    errorMessage: "Twitch has no user with login {{ inputs.broadcaster_login }}."
+
+  - id: stream
+    type: io.kestra.plugin.core.http.Request
+    description: Get Streams returns one entry while the channel is live and none once it is offline.
+    uri: "{{ vars.helix }}/streams?user_id={{ outputs.user.body | jq('.data[0].id') | first }}"
+    headers:
+      Client-Id: "{{ secret('TWITCH_CLIENT_ID') }}"
+      Authorization: "Bearer {{ outputs.auth.body | jq('.access_token') | first }}"
+
+  - id: last_vod
+    type: io.kestra.plugin.core.http.Request
+    description: The latest past broadcast. Its stream_id is the same ID Get Streams returned while it was live.
+    uri: "{{ vars.helix }}/videos?user_id={{ outputs.user.body | jq('.data[0].id') | first }}&type=archive&first=1"
+    headers:
+      Client-Id: "{{ secret('TWITCH_CLIENT_ID') }}"
+      Authorization: "Bearer {{ outputs.auth.body | jq('.access_token') | first }}"
+
+  - id: decide
+    type: io.kestra.plugin.core.output.OutputValues
+    description: |
+      Picks the action and the stream to recap.
+      LIVE: the channel is live, so its session is remembered in KV.
+      RECAP: the channel is offline and there is a session to recap: the tracked one, else (RECAP mode only) the latest VOD if it started within the lookback, else the lookback window.
+      DONE: that stream was already recapped. IDLE: WATCH mode with nothing tracked.
+    values:
+      target: >-
+        {{ {
+          'live': (outputs.stream.body | jq('.data[0]') | first),
+          'tracked': kv('twitch_live_' ~ inputs.broadcaster_login, errorOnMissing=false),
+          'vod': (outputs.last_vod.body | jq('.data[0]') | first),
+          'recapped': kv('twitch_recapped_' ~ inputs.broadcaster_login, errorOnMissing=false),
+          'mode': inputs.mode,
+          'since': (now() | dateAdd(-inputs.lookback_hours, 'HOURS') | date("yyyy-MM-dd'T'HH:mm:ss'Z'", timeZone='UTC'))
+        } | toJson | jq('
+          if .live then {action: "LIVE", stream_id: .live.id, started_at: .live.started_at, title: .live.title, game: .live.game_name}
+          else
+            (if .tracked then .tracked
+             elif .mode == "WATCH" then null
+             elif .vod and .vod.created_at >= .since then {stream_id: .vod.stream_id, started_at: .vod.created_at, title: .vod.title, game: ""}
+             else {stream_id: ("window-" + .since), started_at: .since, title: "", game: ""} end) as $t
+            | if $t == null then {action: "IDLE"}
+              elif $t.stream_id == .recapped then $t + {action: "DONE"}
+              else $t + {action: "RECAP"} end
+          end') | first | toJson }}
+
+  - id: route
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ fromJson(outputs.decide.values.target).action }}"
+    cases:
+      LIVE:
+        - id: remember_live_session
+          type: io.kestra.plugin.core.kv.Set
+          description: Remembers the live session, so the run after it goes offline knows the stream ID and start time.
+          key: "twitch_live_{{ inputs.broadcaster_login }}"
+          kvType: JSON
+          ttl: P3D
+          value: "{{ fromJson(outputs.decide.values.target) | jq('del(.action)') | first | toJson }}"
+
+      RECAP:
+        - id: clips
+          type: io.kestra.plugin.core.http.Request
+          description: Clips created between the stream start and now, most viewed first.
+          uri: "{{ vars.helix }}/clips"
+          params:
+            broadcaster_id: "{{ outputs.user.body | jq('.data[0].id') | first }}"
+            started_at: "{{ fromJson(outputs.decide.values.target).started_at }}"
+            ended_at: "{{ now() | date(\"yyyy-MM-dd'T'HH:mm:ss'Z'\", timeZone='UTC') }}"
+            first: "50"
+          headers:
+            Client-Id: "{{ secret('TWITCH_CLIENT_ID') }}"
+            Authorization: "Bearer {{ outputs.auth.body | jq('.access_token') | first }}"
+
+        - id: if_clips
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ (outputs.clips.body | jq('.data | length') | first) > 0 }}"
+          then:
+            - id: moments
+              type: io.kestra.plugin.core.output.OutputValues
+              description: Groups clips into moments (clips less than 2 minutes apart in the VOD), sums their views and keeps the 15 most viewed moments.
+              values:
+                list: >-
+                  {{ {
+                    'clips': (outputs.clips.body | jq('.data') | first),
+                    'start': fromJson(outputs.decide.values.target).started_at
+                  } | toJson | jq('
+                    .start as $s | .clips
+                    | map(. + {t: (if .vod_offset then .vod_offset else ((.created_at | fromdateiso8601) - ($s | fromdateiso8601)) end)})
+                    | sort_by(.t)
+                    | reduce .[] as $c ([]; if length > 0 and ($c.t - .[-1][-1].t) <= 120 then .[:-1] + [.[-1] + [$c]] else . + [[$c]] end)
+                    | map({minute: (.[0].t / 60 | floor), clips: length, views: (map(.view_count) | add), titles: (map(.title) | unique), best: max_by(.view_count)})
+                    | sort_by(-.views) | .[0:15]
+                    | to_entries | map(.value + {n: (.key + 1)})
+                  ') | first | toJson }}
+
+            - id: rank
+              type: io.kestra.plugin.ai.completion.ChatCompletion
+              description: Picks the moments worth posting, writes a real title for each from the viewers' clip titles, and writes the recap.
+              provider:
+                type: io.kestra.plugin.ai.provider.Ollama
+                endpoint: "{{ vars.ollama_endpoint }}"
+                modelName: "{{ vars.ollama_model }}"
+              configuration:
+                temperature: 0.2
+                maxToken: 2000
+                responseFormat:
+                  type: JSON
+                  jsonSchema:
+                    type: object
+                    required: [recap, highlights]
+                    properties:
+                      recap:
+                        type: string
+                      highlights:
+                        type: array
+                        items:
+                          type: object
+                          required: [n, title]
+                          properties:
+                            n:
+                              type: integer
+                            title:
+                              type: string
+              messages:
+                - type: SYSTEM
+                  content: |
+                    You write the end-of-stream recap for a Twitch channel's Discord server. You get the moments viewers clipped during the stream, most viewed first. Each moment has a number n, its minute in the broadcast, how many clips and views it got, and the titles viewers gave those clips.
+                    1. Pick the moments that make the best highlights, at most the number asked for. Views come first, but when views are close, prefer a moment whose titles say what happened over one with only junk titles.
+                    2. Viewer titles are often useless ("a", "LUL", or the stream title pasted in). Give each pick a new title of at most 8 words, based on all titles of that moment. Never invent events that no title supports. When the titles say nothing, use a neutral title with the time, such as "Big moment at 2h15".
+                    3. The recap is 2 to 4 sentences of plain prose about the stream as a whole, based on the stream title and the clip titles. No lists, no links, no markdown, and do not walk through the picks one by one.
+                    Return the picks in the order they should be shown, best first.
+                - type: USER
+                  content: |
+                    Channel: {{ inputs.broadcaster_login }}
+                    Stream title: {{ fromJson(outputs.decide.values.target).title }}
+                    Moments to pick: {{ inputs.clip_count }}
+                    Moments:
+                    {{ fromJson(outputs.moments.values.list) | jq('map({n, minute, clips, views, titles})') | first | toJson }}
+
+            - id: check_picks
+              type: io.kestra.plugin.core.execution.Fail
+              description: Fails the run instead of posting when the model returned no pick, too many, a repeated pick, or a moment number outside the list.
+              condition: >-
+                {{ {
+                  'count': (fromJson(outputs.moments.values.list) | length),
+                  'picks': (outputs.rank.jsonOutput.highlights ?? []),
+                  'max': inputs.clip_count
+                } | toJson | jq('
+                  .count as $n | [.picks[].n] as $p
+                  | ($p | length) == 0 or ($p | length) > .max or ($p | unique | length) != ($p | length)
+                    or ([$p[] | select(. < 1 or . > $n)] | length) > 0
+                ') | first }}
+              errorMessage: "The model returned invalid highlights: {{ outputs.rank.jsonOutput ?? 'no JSON' }}"
+
+            - id: post_recap
+              type: io.kestra.plugin.discord.DiscordIncomingWebhook
+              description: Links, views and clip counts come from the Twitch data, only the titles and the recap come from the model.
+              url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+              payload: >-
+                {{ {
+                  'login': inputs.broadcaster_login,
+                  'title': fromJson(outputs.decide.values.target).title,
+                  'recap': outputs.rank.jsonOutput.recap,
+                  'picks': outputs.rank.jsonOutput.highlights,
+                  'moments': fromJson(outputs.moments.values.list)
+                } | toJson | jq('
+                  .moments as $m
+                  | {
+                      username: "Twitch stream recap",
+                      content: ("**" + .login + "** just ended a stream" + (if .title != "" then ": " + .title else "" end) + "\n" + .recap | .[0:1900]),
+                      embeds: [.picks | to_entries[] | .key as $i | $m[.value.n - 1] as $x | {
+                        title: (($i + 1 | tostring) + ". " + .value.title | .[0:250]),
+                        url: $x.best.url,
+                        description: (($x.views | tostring) + " views across " + ($x.clips | tostring) + (if $x.clips == 1 then " clip" else " clips" end) + " at " + (($x.minute / 60 | floor) | tostring) + "h" + ((($x.minute % 60) | floor) | tostring | if length == 1 then "0" + . else . end) + ". Top clip by " + $x.best.creator_name + ": \"" + $x.best.title + "\"" | .[0:1000]),
+                        thumbnail: {url: $x.best.thumbnail_url},
+                        color: 9520895
+                      }]
+                    }') | first | toJson }}
+          else:
+            - id: no_clips
+              type: io.kestra.plugin.core.log.Log
+              message: "No clips were made during {{ inputs.broadcaster_login }}'s stream, nothing to post."
+
+        - id: mark_recapped
+          type: io.kestra.plugin.core.kv.Set
+          description: Moves the cursor only after the recap was posted (or there was nothing to post), so a failed post is retried on the next run.
+          key: "twitch_recapped_{{ inputs.broadcaster_login }}"
+          value: "{{ fromJson(outputs.decide.values.target).stream_id }}"
+
+        - id: forget_live_session
+          type: io.kestra.plugin.core.kv.Delete
+          key: "twitch_live_{{ inputs.broadcaster_login }}"
+          errorOnMissing: false
+
+    defaults:
+      - id: skip
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ fromJson(outputs.decide.values.target).action == 'DONE' ? 'Stream ' ~ fromJson(outputs.decide.values.target).stream_id ~ ' was already recapped' : 'No live session tracked for ' ~ inputs.broadcaster_login }}, nothing to do."
+
+finally:
+  - id: revoke_token
+    type: io.kestra.plugin.core.http.Request
+    runIf: "{{ (outputs.auth.body ?? '') != '' }}"
+    uri: https://id.twitch.tv/oauth2/revoke
+    method: POST
+    contentType: application/x-www-form-urlencoded
+    formData:
+      client_id: "{{ secret('TWITCH_CLIENT_ID') }}"
+      token: "{{ outputs.auth.body | jq('.access_token') | first }}"
+
+errors:
+  - id: alert_on_failure
+    type: io.kestra.plugin.discord.DiscordIncomingWebhook
+    url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+    payload: >-
+      {{ {
+        'username': 'Twitch stream recap',
+        'content': 'Twitch recap for ' ~ inputs.broadcaster_login ~ ' failed in ' ~ flow.namespace ~ '.' ~ flow.id ~ ', execution ' ~ execution.id ~ '.'
+      } | toJson }}
+
+triggers:
+  - id: every_10_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/10 * * * *"
+    disabled: true
+    inputs:
+      mode: WATCH
+
+  - id: stream_offline
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: change-me-to-a-long-random-key
+    disabled: true
+    inputs:
+      broadcaster_login: "{{ trigger.body.event.broadcaster_user_login ?? trigger.body.broadcaster_login }}"
+      mode: RECAP
+
+extend:
+  title: Post a Twitch Stream Recap with the Top Clips to Discord
+  metaTitle: Twitch Stream Clip Recap to Discord with a Local LLM | Kestra
+  shortDescription: When a Twitch stream ends, fetch the clips viewers made during it from the Helix API, group duplicate clips into moments, have an LLM pick and retitle the best ones and write a recap, and post it to Discord.
+  metaDescription: Detect when a Twitch stream ends, group its clips into moments, let an Ollama LLM pick and retitle the best ones, and post the recap to Discord.
+  description: |
+    Viewers clip the same moment five times and title it "LUL", so the three most viewed clips are often one moment. When a Twitch stream ends, this flow reads its clips from the Helix API, groups them into moments, has an LLM pick and retitle the best ones and write a recap, and posts it to Discord.
+
+    ## How it works
+
+    1. `every_10_minutes` runs in `WATCH` mode; the `stream_offline` Webhook (EventSub `stream.offline` body) or a manual run uses `RECAP`.
+    2. `auth` mints an app token, then Get Users, Get Streams and Get Videos.
+    3. `decide` compares that with two KV keys and a `Switch` acts. Live: remember the stream in `twitch_live_<login>`. Offline after a tracked stream (or the latest VOD in `RECAP` mode): recap. Already in `twitch_recapped_<login>`: skip.
+    4. `clips` calls Get Clips for the stream window. An `If` skips the AI and Discord when nobody clipped.
+    5. `moments` groups clips less than 2 minutes apart in the VOD with `jq` and sums their views. `rank` (ChatCompletion, Ollama, JSON schema) picks the best moments by number, weighing views against what the viewer titles say, writes a title for each and a recap.
+    6. `check_picks` fails the run on an empty, oversized, repeated or out-of-range answer. `post_recap` posts one embed per moment; links and views come from Twitch data.
+    7. Only then does KV move. `finally` revokes the token, `errors` alerts Discord.
+
+    ## What you get
+
+    - One Discord message per stream: recap, top moments with new titles, views, links and thumbnails.
+    - Each stream recapped once, by schedule or webhook.
+    - A failed post or bad model output leaves KV alone, so the next run retries.
+
+    ## Who it's for
+
+    - Streamers, community managers and stream teams with a Discord server.
+
+    ## Why orchestrate this with Kestra
+
+    - Live-to-offline state lives in KV, not in a polling script's memory.
+    - Each run keeps the Helix responses, model JSON and Discord payload; secrets stay masked.
+
+    ## Prerequisites
+
+    - A Twitch application (app tokens are enough for these endpoints).
+    - Ollama reachable from the worker with `vars.ollama_model` pulled. Pick a non-reasoning model: the AI plugin does not send `think: false`, and a reasoning model can use up `maxToken` before writing JSON.
+    - A Discord incoming webhook.
+
+    ### Secrets
+
+    - `TWITCH_CLIENT_ID`: Twitch application client ID.
+    - `TWITCH_CLIENT_SECRET`: Twitch application client secret.
+    - `DISCORD_WEBHOOK_URL`: Discord webhook for recaps and failure alerts.
+
+    ## Quick start
+
+    1. Add the secrets and point `vars.ollama_endpoint` at your Ollama server.
+    2. Execute with a channel that streamed in the last 24 hours: the recap lands in Discord. Execute again: it logs that the stream was already recapped.
+    3. Set `broadcaster_login` to your channel and keep the schedule on.
+
+    ## How to extend
+
+    - Swap the `provider` block for `GoogleGemini`, `Anthropic` or `OpenAI` with an API key secret; nothing else changes.
+    - For instant recaps, have a small relay answer the EventSub challenge, check the HMAC signature and forward notifications to `stream_offline`. The Webhook trigger cannot check that signature.
+    - Watch several channels from a parent flow with `ForEach` and `Subflow`.
+
+    ## Links
+
+    - [Twitch Helix API reference](https://dev.twitch.tv/docs/api/reference/), [EventSub stream.offline](https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/#streamoffline)
+    - [ChatCompletion](https://kestra.io/plugins/plugin-ai/completion/io.kestra.plugin.ai.completion.chatcompletion), [Ollama provider](https://kestra.io/plugins/plugin-ai/provider/io.kestra.plugin.ai.provider.ollama), [DiscordIncomingWebhook](https://kestra.io/plugins/plugin-discord/io.kestra.plugin.discord.discordincomingwebhook), [KV store](https://kestra.io/docs/concepts/kv-store)
+  tags:
+    - AI
+  subTags:
+    - Content Generation
+    - Agents & Structured Output
+  ee: false
+  demo: false
