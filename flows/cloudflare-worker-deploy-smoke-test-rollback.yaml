@@ -1,0 +1,338 @@
+id: cloudflare-worker-deploy-smoke-test-rollback
+namespace: company.team
+
+description: |
+  Deploys a single-file Cloudflare Worker from a Git commit, then checks the live workers.dev URL until it answers
+  200 with an `x-version` header equal to the commit SHA. If it never does, the flow redeploys the source that was live
+  before, waits until that version answers again, alerts Discord, opens a GitHub issue and fails the execution.
+
+labels:
+  team: platform
+  purpose: worker-deploy
+
+# One deploy at a time: a second push waits, so it never saves the first push's untested upload as its rollback point.
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: repository
+    type: STRING
+    defaults: my-org/my-worker
+    description: GitHub repository (`owner/name`) that holds the Worker source. Issues about failed deploys are opened here too. A push webhook sets it from the payload.
+
+  - id: commit
+    type: STRING
+    description: Commit SHA to deploy. A push webhook sets it to the pushed head commit (`after`). It also becomes the Worker's `VERSION` binding.
+
+  - id: script_path
+    type: STRING
+    defaults: src/worker.js
+    description: Path of the Worker's single module file inside the repository.
+
+  - id: worker_name
+    type: STRING
+    defaults: my-worker
+    description: Name of the Worker script in Cloudflare.
+
+  - id: smoke_url
+    type: URI
+    defaults: https://my-worker.my-account.workers.dev/
+    description: URL the smoke test calls. The workers.dev URL of the Worker, or a route or custom domain, optionally with a health path.
+
+  - id: smoke_timeout
+    type: DURATION
+    defaults: PT2M
+    description: How long the new version gets to answer correctly before the flow rolls back.
+
+variables:
+  # Used for a first deploy. A rollback reuses the compatibility date the previous version was deployed with.
+  compatibility_date: "2026-10-01"
+
+tasks:
+  - id: list_workers
+    type: io.kestra.plugin.cloudflare.workers.scripts.List
+    description: Lists the account's Workers, to know whether there is a deployed version to roll back to.
+    apiToken: "{{ secret('CLOUDFLARE_API_TOKEN') }}"
+    accountId: "{{ secret('CLOUDFLARE_ACCOUNT_ID') }}"
+
+  - id: live_before
+    type: io.kestra.plugin.core.http.Request
+    description: Reads the version the live URL serves right now. allowFailed keeps a 404 or 500 as an answer to inspect instead of an error.
+    uri: "{{ inputs.smoke_url }}"
+    options:
+      allowFailed: true
+
+  - id: already_live
+    type: io.kestra.plugin.core.flow.If
+    description: A redelivered webhook or a manual re-run of the commit that is already serving changes nothing.
+    condition: "{{ outputs.live_before.code == 200 and ((outputs.live_before.headers['x-version'] ?? ['']) | first) == inputs.commit }}"
+    then:
+      - id: nothing_to_do
+        type: io.kestra.plugin.core.execution.Exit
+        state: SUCCESS
+
+  - id: rollback_point
+    type: io.kestra.plugin.core.flow.If
+    description: Saves the source that is deployed now, before it is replaced. Skipped on the very first deploy of the Worker.
+    condition: "{{ outputs.list_workers.rows | jq('any(.[]; .id == \"' ~ inputs.worker_name ~ '\")') | first }}"
+    then:
+      - id: previous_source
+        type: io.kestra.plugin.cloudflare.workers.scripts.Get
+        apiToken: "{{ secret('CLOUDFLARE_API_TOKEN') }}"
+        accountId: "{{ secret('CLOUDFLARE_ACCOUNT_ID') }}"
+        scriptName: "{{ inputs.worker_name }}"
+
+  - id: checkout
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone
+        type: io.kestra.plugin.git.Clone
+        url: "https://github.com/{{ inputs.repository }}.git"
+        commit: "{{ inputs.commit }}"
+        username: "{{ secret('GITHUB_USERNAME') }}"
+        password: "{{ secret('GITHUB_TOKEN') }}"
+
+      - id: worker_source
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: >-
+          Fails the run if the commit has no Worker file, and hands the file to internal storage. The file is taken from this
+          task's outputFiles: on Kestra 2.0.8 the WorkingDirectory's own outputFiles were not yet readable by the next task.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        outputFiles:
+          - "{{ inputs.script_path }}"
+        commands:
+          - test -s "{{ inputs.script_path }}"
+
+  - id: deploy
+    type: io.kestra.plugin.cloudflare.workers.scripts.Deploy
+    description: Uploads the commit's source and sets the plain-text VERSION binding to the commit SHA, which the Worker returns as `x-version`.
+    apiToken: "{{ secret('CLOUDFLARE_API_TOKEN') }}"
+    accountId: "{{ secret('CLOUDFLARE_ACCOUNT_ID') }}"
+    scriptName: "{{ inputs.worker_name }}"
+    script: "{{ read(outputs.worker_source.outputFiles[inputs.script_path]) }}"
+    compatibilityDate: "{{ vars.compatibility_date }}"
+    bindings:
+      - type: plain_text
+        name: VERSION
+        text: "{{ inputs.commit }}"
+
+  - id: first_deploy
+    type: io.kestra.plugin.core.flow.If
+    description: A Worker uploaded through the API starts with its workers.dev route off (wrangler turns it on for you), so a brand-new Worker gets it switched on here.
+    condition: "{{ (outputs.previous_source.script ?? '') == '' }}"
+    then:
+      - id: enable_workers_dev
+        type: io.kestra.plugin.core.http.Request
+        method: POST
+        uri: "https://api.cloudflare.com/client/v4/accounts/{{ secret('CLOUDFLARE_ACCOUNT_ID') }}/workers/scripts/{{ inputs.worker_name }}/subdomain"
+        headers:
+          Authorization: "Bearer {{ secret('CLOUDFLARE_API_TOKEN') }}"
+        body: '{"enabled": true, "previews_enabled": false}'
+
+  - id: smoke_test
+    type: io.kestra.plugin.core.flow.LoopUntil
+    description: Calls the live URL every 5 seconds until the new version answers 200 with its own SHA. Ends quietly at the timeout, so the next task decides.
+    condition: "{{ outputs.probe_new.code == 200 and ((outputs.probe_new.headers['x-version'] ?? ['']) | first) == inputs.commit }}"
+    checkFrequency:
+      interval: PT5S
+      maxDuration: "{{ inputs.smoke_timeout }}"
+    failOnMaxReached: false
+    tasks:
+      - id: probe_new
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.smoke_url }}"
+        options:
+          allowFailed: true
+
+  - id: smoke_result
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.probe_new.code == 200 and ((outputs.probe_new.headers['x-version'] ?? ['']) | first) == inputs.commit }}"
+    then:
+      - id: deployed
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ inputs.worker_name }} serves {{ inputs.commit }} at {{ inputs.smoke_url }}"
+    else:
+      - id: roll_back
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.previous_source.script ?? '') != '' }}"
+        then:
+          - id: redeploy_previous
+            type: io.kestra.plugin.cloudflare.workers.scripts.Deploy
+            description: Puts the saved source back, with the VERSION it answered with before and its own compatibility date.
+            apiToken: "{{ secret('CLOUDFLARE_API_TOKEN') }}"
+            accountId: "{{ secret('CLOUDFLARE_ACCOUNT_ID') }}"
+            scriptName: "{{ inputs.worker_name }}"
+            script: "{{ outputs.previous_source.script }}"
+            format: "{{ outputs.previous_source.format }}"
+            moduleFilename: "{{ outputs.previous_source.entrypoint ?? 'worker.js' }}"
+            compatibilityDate: "{{ outputs.list_workers.rows | jq('.[] | select(.id == \"' ~ inputs.worker_name ~ '\") | .compatibility_date // \"' ~ vars.compatibility_date ~ '\"') | first }}"
+            bindings:
+              - type: plain_text
+                name: VERSION
+                text: "{{ (outputs.live_before.headers['x-version'] ?? ['']) | first }}"
+
+          - id: confirm_rollback
+            type: io.kestra.plugin.core.flow.LoopUntil
+            description: Waits until the live URL answers 200 with the previous version again.
+            condition: "{{ outputs.probe_previous.code == 200 and ((outputs.probe_previous.headers['x-version'] ?? ['']) | first) == ((outputs.live_before.headers['x-version'] ?? ['']) | first) }}"
+            checkFrequency:
+              interval: PT5S
+              maxDuration: "{{ inputs.smoke_timeout }}"
+            failOnMaxReached: false
+            tasks:
+              - id: probe_previous
+                type: io.kestra.plugin.core.http.Request
+                uri: "{{ inputs.smoke_url }}"
+                options:
+                  allowFailed: true
+
+      - id: outcome
+        type: io.kestra.plugin.core.debug.Return
+        description: One line on where the Worker stands now, reused by the alert, the issue and the failure message.
+        format: >-
+          {%- set previous = (outputs.live_before.headers['x-version'] ?? ['']) | first -%}
+          {%- if (outputs.previous_source.script ?? '') == '' -%}
+          No earlier version to roll back to, so {{ inputs.commit | slice(0, 7) }} stays deployed and failing.
+          {%- elseif (outputs.probe_previous.code ?? 0) == 200 and ((outputs.probe_previous.headers['x-version'] ?? ['']) | first) == previous -%}
+          Rolled back: {{ previous | default('the previous version') }} is serving again.
+          {%- else -%}
+          ROLLBACK NOT CONFIRMED: the previous source was redeployed but the URL answered {{ outputs.probe_previous.code ?? 'nothing' }}. Check the Worker now.
+          {%- endif -%}
+
+      - id: alert
+        type: io.kestra.plugin.discord.DiscordIncomingWebhook
+        url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "username": "Kestra deploys",
+            "content": "Worker `{{ inputs.worker_name }}` failed its smoke test after deploying {{ inputs.repository }}@{{ inputs.commit | slice(0, 7) }}: the live URL answered {{ outputs.probe_new.code }} with x-version `{{ (outputs.probe_new.headers['x-version'] ?? ['none']) | first }}` for {{ inputs.smoke_timeout }} seconds.\n{{ outputs.outcome.value }}\n{{ kestra.url ?? '' }}ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+          }
+
+      - id: open_issue
+        type: io.kestra.plugin.github.issues.Create
+        oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+        repository: "{{ inputs.repository }}"
+        title: "Deploy of {{ inputs.commit | slice(0, 7) }} to {{ inputs.worker_name }} failed its smoke test"
+        body: |
+          Kestra deployed https://github.com/{{ inputs.repository }}/commit/{{ inputs.commit }} to the Worker `{{ inputs.worker_name }}`, but {{ inputs.smoke_url }} never answered `200` with `x-version: {{ inputs.commit }}` within {{ inputs.smoke_timeout }} seconds.
+
+          - Last answer: HTTP {{ outputs.probe_new.code }}, x-version `{{ (outputs.probe_new.headers['x-version'] ?? ['none']) | first }}`
+          - Version before the deploy: `{{ (outputs.live_before.headers['x-version'] ?? ['none']) | first }}`
+          - {{ outputs.outcome.value }}
+
+          Execution: {{ kestra.url ?? '' }}ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+        labels:
+          - deploy-failed
+
+      - id: fail
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Smoke test failed for {{ inputs.commit }}. {{ outputs.outcome.value }}"
+
+errors:
+  - id: unexpected_failure
+    type: io.kestra.plugin.core.flow.If
+    description: The smoke-test branch has already alerted when it fails the run on purpose. Anything else (a rejected upload, a clone or API error) alerts here.
+    condition: "{{ (outputs.open_issue.issueUrl ?? '') == '' }}"
+    then:
+      - id: alert_unexpected
+        type: io.kestra.plugin.discord.DiscordIncomingWebhook
+        url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "username": "Kestra deploys",
+            "content": "Deploy of {{ inputs.repository }}@{{ inputs.commit | slice(0, 7) }} to `{{ inputs.worker_name }}` stopped at task `{{ (errorLogs() | length) > 0 ? errorLogs()[0].taskId : 'unknown' }}` before the smoke test finished. Check which version is live.\n{{ kestra.url ?? '' }}ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}"
+          }
+
+triggers:
+  - id: github_push
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: Point a GitHub push webhook (content type application/json) at /api/v1/main/executions/webhook/company.team/cloudflare-worker-deploy-smoke-test-rollback/<key>. Only pushes to main start a deploy.
+    key: replace-with-a-long-random-key
+    disabled: true
+    when: "{{ (trigger.body.ref ?? '') == 'refs/heads/main' and not (trigger.body.deleted ?? false) }}"
+    inputs:
+      repository: "{{ trigger.body.repository.full_name }}"
+      commit: "{{ trigger.body.after }}"
+
+extend:
+  title: Deploy a Cloudflare Worker, Smoke-Test It and Roll Back Automatically
+  metaTitle: Cloudflare Worker Deploy with Smoke Test and Automatic Rollback | Kestra
+  shortDescription: On every push to main, deploy a Cloudflare Worker from Git, check that the live URL serves the new commit, and put the previous source back, alert Discord and open a GitHub issue when it does not.
+  metaDescription: Deploy a Cloudflare Worker from Git on push, smoke-test the live URL for the new commit, and roll back to the saved source with a Discord alert and an issue.
+  description: |
+    A Worker deploy can succeed and still break the site: the upload is accepted, then every request throws. This flow deploys a single-file Worker from the pushed commit, calls the live URL until it answers `200` with an `x-version` header equal to the commit SHA, and if that never happens it puts back the exact source that was live before, waits until that version answers again, posts to Discord, opens a GitHub issue and fails the execution.
+
+    ## How it works
+
+    1. A GitHub push `Webhook` trigger starts the flow for pushes to `main` and passes the repository and the pushed commit as inputs. The trigger ships disabled.
+    2. `workers.scripts.List` and an HTTP call to the live URL record whether the Worker exists and which version it serves now. If it already serves this commit (a redelivered webhook, a re-run), `Exit` ends the run with nothing changed.
+    3. `workers.scripts.Get` saves the deployed source and its format as the rollback point, before anything is replaced.
+    4. `git.Clone` checks out the exact commit, and `workers.scripts.Deploy` uploads the Worker file with a plain-text `VERSION` binding set to the commit SHA. A brand-new Worker also gets its workers.dev route switched on.
+    5. A `LoopUntil` calls the live URL every 5 seconds until it answers `200` with `x-version` equal to the commit, for up to `smoke_timeout`.
+    6. If the check passes, the run succeeds. If not, an `If` redeploys the saved source with its previous `VERSION` and compatibility date, and a second `LoopUntil` waits until the old version answers again.
+    7. `DiscordIncomingWebhook` and `github.issues.Create` report the failed commit, the last answer and whether the rollback was confirmed, then `Fail` marks the execution failed. Any other error (a rejected upload, a clone failure) alerts Discord from the `errors` branch.
+
+    ## What you get
+
+    - Broken Worker releases undone within minutes, without anyone at a keyboard.
+    - A rollback that is verified on the live URL, and an alert that says so plainly when it is not.
+    - A GitHub issue on the repository that holds the code, linked to the commit and the execution.
+    - No redeploy when a webhook is delivered twice, and no two deploys of the same Worker running at once.
+
+    ## Who it's for
+
+    - Platform and web teams that ship Workers straight from Git and want a safety net without a full CI pipeline.
+    - Teams that already orchestrate releases in Kestra and want Workers in the same place.
+
+    ## Why orchestrate this with Kestra
+
+    - The rollback point, the deploy, the checks and the rollback are separate tasks, so each execution shows what was live before, what was deployed and what answered.
+    - Flow `concurrency` queues pushes that arrive during a deploy instead of racing them.
+    - Credentials stay in secrets and are masked in logs, and the same flow can be run by hand for any commit.
+
+    ## Prerequisites
+
+    - A Cloudflare account and a single-file module Worker in a GitHub repository. It must return the `VERSION` binding in an `x-version` response header, for example `headers: { "x-version": env.VERSION }`.
+    - Each deploy sets the Worker's bindings to the ones listed in the two `Deploy` tasks (here only `VERSION`). Add KV, secrets or other bindings there, or they are removed on the next deploy.
+    - Bundled or multi-file Workers need a build step first (see How to extend).
+
+    ### Secrets
+
+    - `CLOUDFLARE_API_TOKEN`: API token with the **Workers Scripts: Edit** permission (the "Edit Cloudflare Workers" template works).
+    - `CLOUDFLARE_ACCOUNT_ID`: the account that owns the Worker.
+    - `GITHUB_USERNAME`: the GitHub user that owns `GITHUB_TOKEN`.
+    - `GITHUB_TOKEN`: token that can read the repository and create issues in it.
+    - `DISCORD_WEBHOOK_URL`: incoming webhook of the channel that gets deploy alerts.
+
+    ## Quick start
+
+    1. Add the secrets to your namespace and set the `repository`, `worker_name` and `smoke_url` defaults to your Worker.
+    2. Click **Execute** with a commit SHA from the repository. The first run creates the Worker if it does not exist yet.
+    3. Replace the trigger `key` with a long random string, enable the trigger, and add a GitHub webhook for push events pointing at `https://<your-kestra>/api/v1/main/executions/webhook/company.team/cloudflare-worker-deploy-smoke-test-rollback/<key>` with content type `application/json`.
+    4. Push a commit and watch the execution. To try the rollback, push a version that throws inside `fetch`.
+
+    ## How to extend
+
+    - Build bundled Workers with `wrangler deploy --dry-run --outdir dist` in a `Commands` task inside the working directory, and deploy the generated file.
+    - Point `smoke_url` at a health route that checks the Worker's own dependencies, or add more `Request` probes to the loop.
+    - Store the last good commit in the KV Store and show it in the alert, or post to Slack with `SlackIncomingWebhook` instead of Discord.
+    - Use Cloudflare's gradual deployments to send a share of traffic to the new version first, and roll back the same way.
+
+    ## Links
+
+    - [Cloudflare Workers Deploy task](https://kestra.io/plugins/plugin-cloudflare/cloudflare-worker-scripts/io.kestra.plugin.cloudflare.workers.scripts.deploy)
+    - [Git Clone task](https://kestra.io/plugins/plugin-git/io.kestra.plugin.git.clone)
+    - [GitHub issues Create task](https://kestra.io/plugins/plugin-github/github-issues/io.kestra.plugin.github.issues.create)
+    - [Discord incoming webhook task](https://kestra.io/plugins/plugin-discord/io.kestra.plugin.discord.discordincomingwebhook)
+    - [LoopUntil task](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loopuntil)
+    - [Cloudflare Workers script upload API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/update/)
+    - [GitHub push webhook payload](https://docs.github.com/en/webhooks/webhook-events-and-payloads#push)
+  tags:
+    - Infrastructure
+  subTags:
+    - CI/CD & Deployment
+    - Incident Response
+  ee: false
+  demo: false
