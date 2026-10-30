@@ -57,7 +57,8 @@ tasks:
       - id: initialize_mock_database
         type: io.kestra.plugin.jdbc.duckdb.Queries
         description: Sets up diagnostic relational tables containing realistic operational records and PII.
-        url: "jdbc:duckdb:diagnostic.duckdb"
+        url: "jdbc:duckdb:"
+        outputDbFile: true
         fetchType: NONE
         sql: |
           CREATE TABLE IF NOT EXISTS customers (
@@ -153,15 +154,18 @@ tasks:
       - id: execute_diagnostic_query
         type: io.kestra.plugin.jdbc.duckdb.Query
         description: Queries diagnostic records with strict limit boundaries against the isolated database.
-        url: "jdbc:duckdb:diagnostic.duckdb"
+        url: "jdbc:duckdb:"
+        databaseUri: "{{ outputs.initialize_mock_database.databaseUri }}"
         fetchType: FETCH
         sql: "SELECT * FROM {{ inputs.target_entity }} WHERE {{ inputs.lookup_filter }} LIMIT {{ inputs.max_records }}"
 
       - id: anonymize_and_mask_records
         type: io.kestra.plugin.scripts.python.Script
         description: Hashes entity IDs and redacts PII before computing cryptographic audit receipt.
+        dependencies:
+          - kestra
         inputFiles:
-          raw_records.json: "{{ outputs.execute_diagnostic_query.rows | json }}"
+          raw_records.json: "{{ outputs.execute_diagnostic_query.rows | toJson }}"
         outputFiles:
           - sanitized_diagnostic_slice.json
         script: |
@@ -176,7 +180,7 @@ tasks:
 
           redaction_mode = "{{ inputs.redaction_mode }}"
           is_dry_run = {{ inputs.dry_run }}
-          salt = "{{ secret('DATA_MASKING_SALT') ?? 'diagnostic-salt-prod-2026' }}"
+          salt = "{{ secret('DATA_MASKING_SALT') }}"
 
           def hash_identifier(val: str, prefix: str) -> str:
               if not val:
@@ -412,7 +416,7 @@ extend:
 
     ### Secrets
 
-    - `DATA_MASKING_SALT`: Cryptographic salt string used to generate HMAC-SHA256 pseudonyms (optional: falls back to a default configuration string if unset).
+    - `DATA_MASKING_SALT`: Cryptographic salt string used to generate HMAC-SHA256 pseudonyms (required: the masking task fails if it is not set).
 
     ### Inputs
 
