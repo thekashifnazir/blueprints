@@ -64,8 +64,8 @@ tasks:
   - id: classify_vault_posture
     type: io.kestra.plugin.core.debug.Return
     description: Evaluates HTTP status codes across liveness, clock sync, and config probes to classify vault operational and security posture.
-    format: |
-      {{ outputs.probe_alive_endpoint.code is not defined or outputs.probe_api_alive_endpoint.code is not defined ? 'INSTANCE_UNREACHABLE' : (outputs.probe_alive_endpoint.code != 200 or outputs.probe_api_alive_endpoint.code != 200 ? 'API_ENGINE_UNHEALTHY' : (outputs.probe_vault_config.code != 200 ? 'VAULT_CONFIG_UNAVAILABLE' : (inputs.enforce_signups_disabled and (((outputs.probe_vault_config.body | json | jq('.signups_allowed') | first) ?? false) == true) ? 'SIGNUPS_POLICY_VIOLATION' : 'HEALTHY_COMPLIANT'))) }}
+    format: |-
+      {{ outputs.probe_alive_endpoint.code is not defined or outputs.probe_api_alive_endpoint.code is not defined ? 'INSTANCE_UNREACHABLE' : (outputs.probe_alive_endpoint.code != 200 or outputs.probe_api_alive_endpoint.code != 200 ? 'API_ENGINE_UNHEALTHY' : (outputs.probe_vault_config.code != 200 ? 'VAULT_CONFIG_UNAVAILABLE' : (inputs.enforce_signups_disabled and (((outputs.probe_vault_config.body | jq('.settings.disableUserRegistration == false') | first) ?? false) == true) ? 'SIGNUPS_POLICY_VIOLATION' : 'HEALTHY_COMPLIANT'))) }}
 
   - id: route_by_posture
     type: io.kestra.plugin.core.flow.Switch
@@ -75,7 +75,7 @@ tasks:
       "HEALTHY_COMPLIANT":
         - id: log_healthy
           type: io.kestra.plugin.core.log.Log
-          message: "Vaultwarden vault at {{ inputs.vaultwarden_scheme }}://{{ inputs.vaultwarden_host }}:{{ inputs.vaultwarden_port }} is HEALTHY_COMPLIANT. /alive status: {{ outputs.probe_alive_endpoint.code }}. /api/alive status: {{ outputs.probe_api_alive_endpoint.code }} (server time: {{ outputs.probe_api_alive_endpoint.body ?? 'N/A' }}). Config status: {{ outputs.probe_vault_config.code }} (signups_allowed: {{ outputs.probe_vault_config.body | json | jq('.signups_allowed') | first ?? false }})."
+          message: "Vaultwarden vault at {{ inputs.vaultwarden_scheme }}://{{ inputs.vaultwarden_host }}:{{ inputs.vaultwarden_port }} is HEALTHY_COMPLIANT. /alive status: {{ outputs.probe_alive_endpoint.code }}. /api/alive status: {{ outputs.probe_api_alive_endpoint.code }} (server time: {{ outputs.probe_api_alive_endpoint.body ?? 'N/A' }}). Config status: {{ outputs.probe_vault_config.code }} (signups_allowed: {{ outputs.probe_vault_config.body | jq('.settings.disableUserRegistration == false') | first ?? false }})."
 
       "SIGNUPS_POLICY_VIOLATION":
         - id: alert_signups_violation_slack
@@ -130,7 +130,7 @@ tasks:
       api_alive_code: "{{ outputs.probe_api_alive_endpoint.code ?? 0 }}"
       server_timestamp: "{{ outputs.probe_api_alive_endpoint.body ?? 'NONE' }}"
       config_http_code: "{{ outputs.probe_vault_config.code ?? 0 }}"
-      signups_allowed: "{{ outputs.probe_vault_config.body | json | jq('.signups_allowed') | first ?? false }}"
+      signups_allowed: "{{ outputs.probe_vault_config.body | jq('.settings.disableUserRegistration == false') | first ?? false }}"
       vault_posture: "{{ outputs.classify_vault_posture.value }}"
 
 errors:
