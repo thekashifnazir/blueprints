@@ -94,7 +94,7 @@ tasks:
   - id: classify_health_status
     type: io.kestra.plugin.core.debug.Return
     description: Evaluates HTTP status codes and table query results to classify the node as HEALTHY, WARNING, CRITICAL, or NODE_UNREACHABLE.
-    format: "{{ (outputs.probe_greptimedb_health.code is not defined or outputs.probe_greptimedb_health.code != 200) ? 'NODE_UNREACHABLE' : ( (outputs.probe_table_inventory.code is not defined or outputs.probe_table_inventory.code != 200) ? 'CRITICAL' : ( ((outputs.probe_table_inventory.body | json | jq('.output[0].records.rows | length') | first) < inputs.min_expected_tables) ? 'WARNING' : 'HEALTHY' ) ) }}"
+    format: "{{ (outputs.probe_greptimedb_health.code is not defined or outputs.probe_greptimedb_health.code != 200) ? 'NODE_UNREACHABLE' : ( (outputs.probe_table_inventory.code is not defined or outputs.probe_table_inventory.code != 200) ? 'CRITICAL' : ( ((outputs.probe_table_inventory.body | jq('.output[0].records.rows | length') | first) < inputs.min_expected_tables) ? 'WARNING' : 'HEALTHY' ) ) }}"
 
   - id: route_by_health_status
     type: io.kestra.plugin.core.flow.Switch
@@ -104,14 +104,14 @@ tasks:
       "HEALTHY":
         - id: log_healthy_state
           type: io.kestra.plugin.core.log.Log
-          message: "GreptimeDB on {{ inputs.greptimedb_host }}:{{ inputs.greptimedb_http_port }} is HEALTHY. Database '{{ inputs.database }}' contains {{ outputs.probe_table_inventory.body | json | jq('.output[0].records.rows | length') | first }} table(s). Query execution: {{ outputs.probe_table_inventory.body | json | jq('.execution_time_ms') | first }}ms."
+          message: "GreptimeDB on {{ inputs.greptimedb_host }}:{{ inputs.greptimedb_http_port }} is HEALTHY. Database '{{ inputs.database }}' contains {{ outputs.probe_table_inventory.body | jq('.output[0].records.rows | length') | first }} table(s). Query execution: {{ outputs.probe_table_inventory.body | jq('.execution_time_ms') | first }}ms."
 
       "WARNING":
         - id: alert_warning_slack
           type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
           url: "{{ secret('SLACK_WEBHOOK') }}"
           payload: |
-            {{ {"text": "GreptimeDB Sentinel WARNING on " ~ inputs.greptimedb_host ~ ":" ~ inputs.greptimedb_http_port ~ ". Found " ~ (outputs.probe_table_inventory.body | json | jq('.output[0].records.rows | length') | first) ~ " table(s) in database '" ~ inputs.database ~ "', below minimum expected threshold of " ~ inputs.min_expected_tables ~ ". Execution: " ~ execution.id ~ "."} | toJson }}
+            {{ {"text": "GreptimeDB Sentinel WARNING on " ~ inputs.greptimedb_host ~ ":" ~ inputs.greptimedb_http_port ~ ". Found " ~ (outputs.probe_table_inventory.body | jq('.output[0].records.rows | length') | first) ~ " table(s) in database '" ~ inputs.database ~ "', below minimum expected threshold of " ~ inputs.min_expected_tables ~ ". Execution: " ~ execution.id ~ "."} | toJson }}
 
         - id: check_auto_compaction
           type: io.kestra.plugin.core.flow.If
