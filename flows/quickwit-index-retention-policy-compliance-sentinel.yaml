@@ -78,15 +78,15 @@ tasks:
     message: |
       Quickwit Retention Audit Evaluation for Index '{{ inputs.index_id }}':
       - Index UID: {{ outputs.probe_index_metadata.indexUid }}
-      - Configured Retention: {{ outputs.probe_index_metadata.metadata.indexConfig.retention | json }}
+      - Configured Retention: {{ (outputs.probe_index_metadata.metadata.index_config.retention ?? null) | toJson }}
       - Approved Retention Period: {{ inputs.approved_retention_period }}
-      - Canary Hits Count: {{ outputs.probe_search_availability.numHits }}
+      - Canary Hits Count: {{ outputs.probe_search_availability.total }}
       - Search Latency: {{ outputs.probe_search_availability.elapsedTimeMicros / 1000 }} ms (Threshold: {{ inputs.max_query_latency_ms }} ms)
 
   - id: route_by_compliance_status
     type: io.kestra.plugin.core.flow.Switch
     description: Branch flow execution based on Quickwit retention policy compliance and search health.
-    value: "{{ (outputs.probe_index_metadata.metadata == null or outputs.probe_index_metadata.metadata.indexConfig == null or outputs.probe_index_metadata.metadata.indexConfig.retention == null) ? 'CRITICAL_RETENTION_UNCONFIGURED' : (inputs.enforce_strict_period and outputs.probe_index_metadata.metadata.indexConfig.retention.period != inputs.approved_retention_period ? 'POLICY_RETENTION_EXCEEDED' : 'COMPLIANT') }}"
+    value: "{{ (outputs.probe_index_metadata.metadata == null or outputs.probe_index_metadata.metadata.index_config == null or outputs.probe_index_metadata.metadata.index_config.retention is not defined) ? 'CRITICAL_RETENTION_UNCONFIGURED' : (inputs.enforce_strict_period and outputs.probe_index_metadata.metadata.index_config.retention.period != inputs.approved_retention_period ? 'POLICY_RETENTION_EXCEEDED' : 'COMPLIANT') }}"
     cases:
       CRITICAL_RETENTION_UNCONFIGURED:
         - id: log_critical_retention_breach
@@ -154,7 +154,7 @@ tasks:
         - id: log_policy_warning
           type: io.kestra.plugin.core.log.Log
           level: WARN
-          message: "WARNING: Quickwit index '{{ inputs.index_id }}' configured retention period '{{ outputs.probe_index_metadata.metadata.indexConfig.retention.period }}' does not match approved period '{{ inputs.approved_retention_period }}'."
+          message: "WARNING: Quickwit index '{{ inputs.index_id }}' configured retention period '{{ outputs.probe_index_metadata.metadata.index_config.retention.period }}' does not match approved period '{{ inputs.approved_retention_period }}'."
 
         - id: alert_slack_warning
           type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
@@ -182,7 +182,7 @@ tasks:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "*Configured Period:*\n`{{ outputs.probe_index_metadata.metadata.indexConfig.retention.period }}`"
+                      "text": "*Configured Period:*\n`{{ outputs.probe_index_metadata.metadata.index_config.retention.period }}`"
                     },
                     {
                       "type": "mrkdwn",
@@ -209,7 +209,7 @@ tasks:
       COMPLIANT:
         - id: log_compliant_status
           type: io.kestra.plugin.core.log.Log
-          message: "Quickwit index '{{ inputs.index_id }}' is COMPLIANT: retention period is '{{ outputs.probe_index_metadata.metadata.indexConfig.retention.period }}' on schedule '{{ outputs.probe_index_metadata.metadata.indexConfig.retention.schedule }}'. Canary query executed in {{ outputs.probe_search_availability.elapsedTimeMicros / 1000 }} ms."
+          message: "Quickwit index '{{ inputs.index_id }}' is COMPLIANT: retention period is '{{ outputs.probe_index_metadata.metadata.index_config.retention.period }}' on schedule '{{ outputs.probe_index_metadata.metadata.index_config.retention.schedule }}'. Canary query executed in {{ outputs.probe_search_availability.elapsedTimeMicros / 1000 }} ms."
 
   - id: log_audit_summary
     type: io.kestra.plugin.core.log.Log
@@ -219,10 +219,10 @@ tasks:
       - Execution ID: {{ execution.id }}
       - Cluster: {{ inputs.quickwit_url }}
       - Index: {{ inputs.index_id }} (UID: {{ outputs.probe_index_metadata.indexUid }})
-      - Retention Defined: {{ outputs.probe_index_metadata.metadata.indexConfig.retention != null }}
-      - Retention Period: {{ outputs.probe_index_metadata.metadata.indexConfig.retention.period ?? 'NONE' }}
-      - Status: {{ (outputs.probe_index_metadata.metadata == null or outputs.probe_index_metadata.metadata.indexConfig == null or outputs.probe_index_metadata.metadata.indexConfig.retention == null) ? 'CRITICAL_RETENTION_UNCONFIGURED' : (inputs.enforce_strict_period and outputs.probe_index_metadata.metadata.indexConfig.retention.period != inputs.approved_retention_period ? 'POLICY_RETENTION_EXCEEDED' : 'COMPLIANT') }}
-      - Canary Hits: {{ outputs.probe_search_availability.numHits }}
+      - Retention Defined: {{ outputs.probe_index_metadata.metadata.index_config.retention is defined }}
+      - Retention Period: {{ outputs.probe_index_metadata.metadata.index_config.retention.period ?? 'NONE' }}
+      - Status: {{ (outputs.probe_index_metadata.metadata == null or outputs.probe_index_metadata.metadata.index_config == null or outputs.probe_index_metadata.metadata.index_config.retention is not defined) ? 'CRITICAL_RETENTION_UNCONFIGURED' : (inputs.enforce_strict_period and outputs.probe_index_metadata.metadata.index_config.retention.period != inputs.approved_retention_period ? 'POLICY_RETENTION_EXCEEDED' : 'COMPLIANT') }}
+      - Canary Hits: {{ outputs.probe_search_availability.total }}
       - Canary Latency Micros: {{ outputs.probe_search_availability.elapsedTimeMicros }}
       - Timestamp: {{ now() }}
 
