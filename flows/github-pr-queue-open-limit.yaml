@@ -1,0 +1,365 @@
+id: github-pr-queue-open-limit
+namespace: company.team
+
+description: |
+  Contributor-side pull request queue. Branches wait in KV, and the next one is opened as a pull request only when
+  the author has fewer open pull requests than the program allows. The maintainer-side companion is
+  `github-pr-contribution-rules-check`, which warns authors who are over the limit; this flow keeps you under it.
+
+inputs:
+  - id: repository
+    type: STRING
+    displayName: Target repository
+    description: owner/name of the repository that receives the pull requests.
+    defaults: kestra-io/blueprints
+
+  - id: base_branch
+    type: STRING
+    displayName: Base branch
+    description: Branch the pull requests target.
+    defaults: main
+
+  - id: max_open
+    type: INT
+    displayName: Max open PRs
+    description: The program rule. A new pull request is opened only while you have fewer open ones than this.
+    defaults: 2
+
+  - id: count_scope
+    type: SELECT
+    displayName: Count open PRs across
+    description: >
+      REPOSITORY counts your open pull requests in the target repository only. ORGANIZATION counts them in every
+      repository of its owner, for a program whose limit spans several repositories.
+    values:
+      - REPOSITORY
+      - ORGANIZATION
+    defaults: REPOSITORY
+
+  - id: fork_owner
+    type: STRING
+    displayName: Fork owner
+    description: Owner of the repository that holds the queued branches. Leave empty to use the login of the GitHub token.
+    defaults: ""
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry run
+    description: When true, the run counts and logs what it would open, and opens, deletes and posts nothing. Use it once against the real repository before enabling the schedule.
+    defaults: false
+
+variables:
+  api: https://api.github.com
+  queue_prefix: pr-queue-
+  opened_prefix: pr-opened-
+
+checks:
+  - when: "{{ inputs.max_open >= 1 and inputs.max_open <= 20 }}"
+    message: max_open must be between 1 and 20.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+  - when: "{{ {'r': inputs.repository} | jq('.r | test(\"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$\")') | first }}"
+    message: repository must be owner/name, for example kestra-io/blueprints.
+    style: ERROR
+    behavior: BLOCK_EXECUTION
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+triggers:
+  - id: every_15_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Check for a free slot every 15 minutes. A run that finds no slot or an empty queue ends without doing anything.
+    cron: "*/15 * * * *"
+    recoverMissedSchedules: NONE
+    disabled: true
+
+tasks:
+  - id: whoami
+    type: io.kestra.plugin.core.http.Request
+    description: The pull requests are opened as the token owner, so that login is the author whose open pull requests are counted. A bad token fails here, before anything is read or written.
+    uri: "{{ vars.api }}/user"
+    headers:
+      Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+      Accept: application/vnd.github+json
+      X-GitHub-Api-Version: "2022-11-28"
+
+  - id: tracked
+    type: io.kestra.plugin.core.kv.GetKeys
+    description: Pull requests this flow opened earlier and has not yet seen merged or closed.
+    prefix: "{{ vars.opened_prefix }}"
+
+  - id: check_tracked
+    type: io.kestra.plugin.core.flow.Loop
+    description: |
+      Read each tracked pull request through the REST API, which is consistent right after a create, unlike search.
+      A merged or closed one has freed its slot: it is announced with its outcome and forgotten.
+    values: "{{ outputs.tracked['keys'] ?? [] }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: pr_state
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ kv(item.value).api_url }}"
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: application/vnd.github+json
+          X-GitHub-Api-Version: "2022-11-28"
+
+      - id: released
+        type: io.kestra.plugin.core.flow.If
+        description: A dry run only counts; it neither announces nor forgets.
+        condition: "{{ fromJson(outputs.pr_state.body).state != 'open' and not inputs.dry_run }}"
+        then:
+          - id: forget
+            type: io.kestra.plugin.core.kv.Delete
+            key: "{{ item.value }}"
+            errorOnMissing: false
+
+          - id: notify_released
+            type: io.kestra.plugin.discord.DiscordIncomingWebhook
+            description: allowFailure so a Discord outage never blocks the queue; the same text is in the logs.
+            allowFailure: true
+            url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+            payload: |
+              {{ {'content': 'Slot released: ' ~ (fromJson(outputs.pr_state.body).merged ? 'merged ' : 'closed without merge ') ~ fromJson(outputs.pr_state.body).html_url ~ ' (' ~ fromJson(outputs.pr_state.body).title ~ ')'} | toJson }}
+    outputs:
+      - id: row
+        type: JSON
+        value: |
+          {{ {'key': item.value, 'repo': fromJson(outputs.pr_state.body).base.repo.full_name, 'url': fromJson(outputs.pr_state.body).html_url, 'open': fromJson(outputs.pr_state.body).state == 'open', 'merged': fromJson(outputs.pr_state.body).merged} | toJson }}
+
+  - id: open_prs
+    type: io.kestra.plugin.github.pulls.Search
+    description: Your open pull requests in the repository, or in every repository of its owner. Search is indexed with a delay of a few seconds, which the tracked pull requests above cover.
+    oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+    query: "is:pr is:open author:{{ fromJson(outputs.whoami.body).login }} {{ inputs.count_scope == 'ORGANIZATION' ? 'user:' ~ (inputs.repository | split('/') | first) : 'repo:' ~ inputs.repository }}"
+    fetchType: FETCH
+
+  - id: queue
+    type: io.kestra.plugin.core.kv.GetKeys
+    description: The queued branches, one KV key each. Keys are opened in sort order, so name them pr-queue-01-..., pr-queue-02-...
+    prefix: "{{ vars.queue_prefix }}"
+
+  - id: plan
+    type: io.kestra.plugin.core.output.OutputValues
+    description: |
+      Open pull requests = search hits, minus tracked ones the REST API just reported merged or closed, plus tracked
+      ones still open (only tracked pull requests inside the counted scope). Search lags behind both an open and a
+      close; the REST state corrects it in both directions.
+    values:
+      open_urls: >-
+        {{ {'search': (outputs.open_prs.rows ?? []) | jq('[.[].url]') | first,
+            'tracked': (outputs.check_tracked.outputs ?? []) | jq('[.[].outputs.row]') | first,
+            'repo': inputs.repository, 'org': inputs.count_scope == 'ORGANIZATION'}
+           | jq('.repo as $repo | (.repo | split("/") | first) as $owner | .org as $org
+                 | [.tracked[] | select(if $org then (.repo | split("/") | first) == $owner else .repo == $repo end)] as $t
+                 | ((.search - [$t[] | select(.open | not) | .url]) + [$t[] | select(.open) | .url]) | unique')
+           | first | toJson }}
+      head_owner: "{{ inputs.fork_owner | trim is empty ? fromJson(outputs.whoami.body).login : inputs.fork_owner | trim }}"
+
+  - id: slots
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      open_count: "{{ fromJson(outputs.plan.values.open_urls) | length }}"
+      queued: "{{ (outputs.queue['keys'] ?? []) | length }}"
+      next: >-
+        {{ {'q': outputs.queue['keys'] ?? [], 'n': inputs.max_open - (fromJson(outputs.plan.values.open_urls) | length)}
+           | jq('.n as $n | if $n > 0 then (.q | sort | .[0:$n]) else [] end') | first | toJson }}
+
+  - id: log_plan
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      {{ fromJson(outputs.whoami.body).login }} has {{ outputs.slots.values.open_count }} open PR(s) of {{ inputs.max_open }}
+      ({{ fromJson(outputs.plan.values.open_urls) | join(', ') }}). {{ outputs.slots.values.queued }} queued.
+      {{ inputs.dry_run ? 'Dry run, would open' : 'Opening now' }}: {{ fromJson(outputs.slots.values.next) | length == 0 ? 'nothing' : fromJson(outputs.slots.values.next) | join(', ') }}.
+
+  - id: has_work
+    type: io.kestra.plugin.core.flow.If
+    description: No free slot, an empty queue or a dry run ends the run quietly.
+    condition: "{{ fromJson(outputs.slots.values.next) | length > 0 and not inputs.dry_run }}"
+    then:
+      - id: open_next
+        type: io.kestra.plugin.core.flow.Loop
+        description: |
+          One queued branch at a time, in key order. A failure stops the loop and fails the run before that key is
+          deleted, so the item stays at the head of the queue and nothing after it jumps ahead.
+        values: "{{ outputs.slots.values.next }}"
+        concurrencyLimit: 1
+        tasks:
+          - id: queued
+            type: io.kestra.plugin.core.output.OutputValues
+            description: Read the queue item once. Its key is deleted further down, so later tasks use these values, not kv().
+            values:
+              branch: "{{ kv(item.value).branch }}"
+              title: "{{ kv(item.value).title }}"
+              body: "{{ kv(item.value).body ?? '' }}"
+
+          - id: existing
+            type: io.kestra.plugin.core.http.Request
+            description: Double-open guard. Any pull request, in any state, already opened from this head branch into the repository.
+            uri: "{{ vars.api }}/repos/{{ inputs.repository }}/pulls?state=all&head={{ outputs.plan.values.head_owner }}:{{ outputs.queued.values.branch }}"
+            headers:
+              Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+              Accept: application/vnd.github+json
+              X-GitHub-Api-Version: "2022-11-28"
+
+          - id: not_opened_yet
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ fromJson(outputs.existing.body) | length == 0 }}"
+            then:
+              - id: create_pr
+                type: io.kestra.plugin.github.pulls.Create
+                oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+                repository: "{{ inputs.repository }}"
+                sourceBranch: "{{ outputs.plan.values.head_owner }}:{{ outputs.queued.values.branch }}"
+                targetBranch: "{{ inputs.base_branch }}"
+                title: "{{ outputs.queued.values.title }}"
+                body: "{{ outputs.queued.values.body }}"
+                maintainerCanModify: true
+
+              - id: track
+                type: io.kestra.plugin.core.kv.Set
+                description: Remember the new pull request so the next run counts it without waiting for search, and announces when it is merged or closed.
+                key: "{{ vars.opened_prefix }}{{ outputs.create_pr.issueUrl | split('/') | last }}"
+                kvType: JSON
+                value: |
+                  {{ {'number': outputs.create_pr.issueUrl | split('/') | last, 'url': outputs.create_pr.pullRequestUrl, 'api_url': vars.api ~ '/repos/' ~ inputs.repository ~ '/pulls/' ~ (outputs.create_pr.issueUrl | split('/') | last), 'branch': outputs.queued.values.branch, 'title': outputs.queued.values.title, 'opened_at': now(), 'execution_id': execution.id} | toJson }}
+            else:
+              - id: already_opened
+                type: io.kestra.plugin.core.log.Log
+                level: WARN
+                message: "{{ outputs.queued.values.branch }} already has {{ fromJson(outputs.existing.body)[0].html_url }} ({{ fromJson(outputs.existing.body)[0].state }}). Removing it from the queue without opening another one."
+
+          - id: pop
+            type: io.kestra.plugin.core.kv.Delete
+            description: The queue only moves after the pull request exists (or already existed).
+            key: "{{ item.value }}"
+            errorOnMissing: false
+
+          - id: notify_opened
+            type: io.kestra.plugin.discord.DiscordIncomingWebhook
+            description: allowFailure so a Discord outage never undoes a move of the queue; the same facts are in the loop outputs.
+            allowFailure: true
+            url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+            payload: |
+              {{ {'content': (outputs.create_pr.pullRequestUrl is defined ? 'Opened ' ~ outputs.create_pr.pullRequestUrl : 'Skipped, already has ' ~ (fromJson(outputs.existing.body) | first).html_url) ~ ' (' ~ outputs.queued.values.title ~ ') from `' ~ outputs.plan.values.head_owner ~ ':' ~ outputs.queued.values.branch ~ '` into `' ~ inputs.repository ~ ':' ~ inputs.base_branch ~ '`.'} | toJson }}
+        outputs:
+          - id: row
+            type: JSON
+            value: |
+              {{ {'key': item.value, 'branch': outputs.queued.values.branch ?? null, 'url': outputs.create_pr.pullRequestUrl ?? (fromJson(outputs.existing.body ?? '[]') | jq('.[0].html_url') | first), 'opened': outputs.create_pr.pullRequestUrl is defined} | toJson }}
+        errors:
+          - id: alert_item_failed
+            type: io.kestra.plugin.discord.DiscordIncomingWebhook
+            description: |
+              Runs inside the failed iteration. errorLogs() is empty there on 2.0.8, so the message links to the run,
+              whose `open_next` error links to the iteration with the GitHub error. The key was not deleted, so the
+              next run retries the same item first.
+            allowFailure: true
+            url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+            payload: |
+              {{ {'content': 'Could not open `' ~ outputs.plan.values.head_owner ~ ':' ~ (outputs.queued.values.branch ?? item.value) ~ '` into `' ~ inputs.repository ~ ':' ~ inputs.base_branch ~ '` (queue key `' ~ item.value ~ '`). It stays at the head of the queue and the next run retries it. A 422 on `head` means the branch is not pushed. Error: ' ~ (kestra.url ?? '') ~ 'ui/main/executions/' ~ flow.namespace ~ '/' ~ flow.id ~ '/' ~ execution.id} | toJson }}
+
+      - id: log_result
+        type: io.kestra.plugin.core.log.Log
+        message: "{% for r in outputs.open_next.outputs %}{{ r.outputs.row.opened ? 'Opened' : 'Already existed, dequeued' }}: {{ r.outputs.row.url }} ({{ r.outputs.row.branch }}). {% endfor %}"
+    else:
+      - id: nothing_to_do
+        type: io.kestra.plugin.core.log.Log
+        message: "{{ inputs.dry_run ? 'Dry run.' : ((outputs.queue['keys'] ?? []) | length == 0 ? 'Queue is empty.' : 'No free slot.') }} Nothing opened."
+
+errors:
+  - id: first_error
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Read once, at the top of the branch, because errorLogs() also returns lines logged by the branch itself.
+    values:
+      task: "{{ (errorLogs() | length) > 0 ? (errorLogs()[0].taskId ?? 'none') : 'none' }}"
+      message: "{{ (errorLogs() | length) > 0 ? (errorLogs()[0].message | abbreviate(1500)) : 'no error line was logged' }}"
+
+  - id: alert_failure
+    type: io.kestra.plugin.discord.DiscordIncomingWebhook
+    description: A failed queue item already sent its own alert from `open_next`, so this one covers every other task (bad token, GitHub search down). allowFailure keeps the original error visible.
+    runIf: "{{ outputs.first_error.values.task != 'open_next' }}"
+    allowFailure: true
+    url: "{{ secret('DISCORD_WEBHOOK_URL') }}"
+    payload: |
+      {{ {'content': 'PR queue for ' ~ inputs.repository ~ ' failed in `' ~ outputs.first_error.values.task ~ '`: ' ~ outputs.first_error.values.message ~ ' The queue did not move. ' ~ (kestra.url ?? '') ~ 'ui/main/executions/' ~ flow.namespace ~ '/' ~ flow.id ~ '/' ~ execution.id} | toJson }}
+
+outputs:
+  - id: opened
+    type: JSON
+    description: One row per queue item handled by this run, with the pull request URL and whether it was opened now or already existed.
+    value: "{{ (outputs.open_next.outputs ?? []) | jq('[.[].outputs.row]') | first }}"
+
+extend:
+  title: Queue GitHub pull requests and open the next one only when an open-PR slot frees up
+  metaTitle: GitHub PR Queue That Respects an Open-PR Limit | Kestra
+  shortDescription: Keep finished branches in a KV queue and open them as pull requests one by one, only while you are under the program's open-PR limit, with a Discord message for every PR opened and every slot freed.
+  metaDescription: Queue branches in Kestra KV and open the next GitHub pull request only when your open-PR count drops below the limit. Double-open guard, Discord alerts.
+  description: |
+    Coding agents let a contributor finish branches faster than maintainers can review them, so contribution programs cap open pull requests per author (Kestra Hacktober allows 2). This flow keeps finished branches in a KV queue and, every 15 minutes, opens the next one only when you are under the limit.
+
+    It is the contributor-side mirror of `github-pr-contribution-rules-check`, which comments on the maintainer side when an author is over the limit: that flow enforces the rule, this one keeps you under it.
+
+    This blueprint was created by [thekashifnazir](https://github.com/thekashifnazir).
+
+    ## How it works
+
+    1. `every_15_minutes` (Schedule, shipped disabled) or a manual run starts the flow. `checks` reject a bad `max_open` or `repository`, and `concurrency` cancels an overlapping run.
+    2. `whoami` reads the token's login: pull requests are opened as that user, so it is the author counted and the default fork owner.
+    3. `check_tracked` (`Loop`) reads each pull request this flow opened (KV `pr-opened-<number>`) through the REST API. A merged or closed one has freed its slot: Discord gets "merged" or "closed without merge" and the key is deleted.
+    4. `open_prs` (`io.kestra.plugin.github.pulls.Search`) finds your open pull requests in the repository, or in every repository of its owner with `count_scope: ORGANIZATION`.
+    5. `plan` counts the search hits, minus tracked pull requests the REST API reports closed, plus tracked ones still open, so search indexing lag can't cause an over- or under-count. The free slots take the first queue keys in sort order.
+    6. `open_next` (`Loop`, one item at a time): `existing` checks for any pull request already opened from `fork_owner:branch`; if none, `create_pr` (`io.kestra.plugin.github.pulls.Create`) opens it and `track` stores it. Only then does `pop` delete the queue key, and Discord gets the link.
+    7. If a create fails, the key is not deleted, so the item stays first in line. `alert_item_failed` posts the branch and the run link and the run ends FAILED. Other failures go to `alert_failure`.
+
+    ## What you get
+
+    - Never more than `max_open` open pull requests, with the next one opened within 15 minutes of a merge or close.
+    - A queue that moves only after the pull request exists, and no second PR for a branch that already had one (it is dequeued with a warning).
+    - Discord messages for each PR opened, each slot released (with its outcome) and each failure.
+    - `dry_run` to see what would be opened, and the flow output `opened` with one row per item handled.
+
+    ## Who it's for
+
+    - Contributors, human or agent-assisted, in programs with a per-author open-PR limit.
+    - Teams whose bots open pull requests into repositories that limit concurrent PRs.
+
+    ## Why orchestrate this with Kestra
+
+    - Queue and opened-PR state live in KV, survive restarts and can be edited from the UI.
+    - Schedule, concurrency guard and per-item failure handling are declarative, and every run keeps its GitHub responses, using native GitHub and Discord tasks with no script container.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with the GitHub and Discord plugins, your branches pushed to your fork, and a Discord channel webhook.
+
+    ### Secrets
+
+    - `GITHUB_TOKEN`: token of the account that opens the pull requests. Classic: `public_repo` (`repo` for private repositories). Fine-grained: Pull requests read and write on the target.
+    - `DISCORD_WEBHOOK_URL`: Discord incoming webhook for notifications and alerts.
+
+    ## Quick start
+
+    1. Add the secrets and set the input defaults to your program's rule.
+    2. Add one KV key per branch in the flow's namespace, named in the order to open them, for example `pr-queue-01-docs-fix` with the JSON value `{"branch": "docs-fix", "title": "docs: fix the quick start", "body": "Why and how it was tested."}`.
+    3. Run with `dry_run: true`: `log_plan` shows your open pull requests and what would be opened.
+    4. Enable `every_15_minutes`. Disable it to pause; queued keys stay put.
+
+    ## How to extend
+
+    - Post to Slack with `io.kestra.plugin.slack.notifications.SlackIncomingWebhook` instead of Discord.
+    - Open drafts with `draft: true`, or request reviewers with `reviewers` on `create_pr`.
+
+    ## Links
+
+    - [GitHub plugin](https://kestra.io/plugins/plugin-github): [pulls.Search](https://kestra.io/plugins/plugin-github/pulls/io.kestra.plugin.github.pulls.search), [pulls.Create](https://kestra.io/plugins/plugin-github/pulls/io.kestra.plugin.github.pulls.create)
+    - [Discord plugin](https://kestra.io/plugins/plugin-discord/io.kestra.plugin.discord.discordincomingwebhook), [Loop](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.loop), [KV Store](https://kestra.io/docs/concepts/kv-store)
+    - [GitHub REST: list pull requests](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests)
+  tags:
+    - Infrastructure
+  subTags:
+    - CI/CD & Deployment
+  ee: false
+  demo: false
