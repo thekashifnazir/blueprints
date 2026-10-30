@@ -104,7 +104,7 @@ tasks:
       - Record Count: {{ outputs.probe_table_record_metrics.row.total_records ?? 0 }}
       - Warning Threshold: {{ inputs.warning_threshold_records }}
       - Critical Threshold: {{ inputs.critical_threshold_records }}
-      - Active Indexes: {{ outputs.probe_table_schema_indexes.row.indexes | json }}
+      - Active Indexes: {{ outputs.probe_table_schema_indexes.row.indexes | toJson }}
 
   - id: route_by_saturation_level
     type: io.kestra.plugin.core.flow.Switch
