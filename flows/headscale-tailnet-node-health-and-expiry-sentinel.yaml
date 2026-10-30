@@ -81,8 +81,8 @@ tasks:
   - id: classify_tailnet_status
     type: io.kestra.plugin.core.debug.Return
     description: Evaluates API response codes, node expiration timestamps, and connectivity to classify tailnet state into HEALTHY, OFFLINE_NODES_WARNING, EXPIRED_NODES_CRITICAL, PROBE_FAILED, or CONTROL_PLANE_UNREACHABLE.
-    format: |
-      {{ (outputs.probe_headscale_health.code is not defined or outputs.probe_headscale_health.code != 200) ? 'CONTROL_PLANE_UNREACHABLE' : ( (outputs.probe_headscale_nodes.code is not defined or outputs.probe_headscale_nodes.code != 200) ? 'PROBE_FAILED' : ( ((outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select((.expiry != null and .expiry != "" and .expiry != "0001-01-01T00:00:00Z") and (((.expiry | fromdateiso8601) - now) / 86400) < ' ~ inputs.days_to_expiry_threshold ~ ')] | length') | first) > 0) ? 'EXPIRED_NODES_CRITICAL' : ( (inputs.alert_on_offline_nodes == 'true' and ((outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select(.online == false)] | length') | first) > 0)) ? 'OFFLINE_NODES_WARNING' : 'HEALTHY' ) ) ) }}
+    format: |-
+      {{ (outputs.probe_headscale_health.code is not defined or outputs.probe_headscale_health.code != 200) ? 'CONTROL_PLANE_UNREACHABLE' : ( (outputs.probe_headscale_nodes.code is not defined or outputs.probe_headscale_nodes.code != 200) ? 'PROBE_FAILED' : ( ((outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select((.expiry != null and .expiry != "" and .expiry != "0001-01-01T00:00:00Z") and (((.expiry[0:19] + "Z" | fromdateiso8601) - now) / 86400) < ' ~ inputs.days_to_expiry_threshold ~ ')] | length') | first) > 0) ? 'EXPIRED_NODES_CRITICAL' : ( (inputs.alert_on_offline_nodes == 'true' and ((outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select(.online == false)] | length') | first) > 0)) ? 'OFFLINE_NODES_WARNING' : 'HEALTHY' ) ) ) }}
 
   - id: route_by_tailnet_status
     type: io.kestra.plugin.core.flow.Switch
@@ -92,25 +92,25 @@ tasks:
       "HEALTHY":
         - id: log_healthy_state
           type: io.kestra.plugin.core.log.Log
-          message: "Headscale tailnet on {{ inputs.headscale_host }}:{{ inputs.headscale_port }} is HEALTHY. Registered nodes: {{ outputs.probe_headscale_nodes.body | json | jq('.nodes | length') | first }}. Active users: {{ outputs.probe_headscale_users.body | json | jq('.users | length') | first }}. All machine keys valid."
+          message: "Headscale tailnet on {{ inputs.headscale_host }}:{{ inputs.headscale_port }} is HEALTHY. Registered nodes: {{ outputs.probe_headscale_nodes.body | jq('.nodes | length') | first }}. Active users: {{ outputs.probe_headscale_users.body | jq('.users | length') | first }}. All machine keys valid."
 
       "OFFLINE_NODES_WARNING":
         - id: alert_offline_nodes_slack
           type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
           url: "{{ secret('SLACK_WEBHOOK') }}"
           payload: |
-            {{ {"text": "Headscale Tailnet WARNING on " ~ inputs.headscale_host ~ ":" ~ inputs.headscale_port ~ ". Detected offline node(s): " ~ (outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select(.online == false) | .givenName + \" (\" + (.ipAddresses[0] // \"no-ip\") + \")\"] | join(\", \")') | first) ~ ". Execution: " ~ execution.id ~ "."} | toJson }}
+            {{ {"text": "Headscale Tailnet WARNING on " ~ inputs.headscale_host ~ ":" ~ inputs.headscale_port ~ ". Detected offline node(s): " ~ (outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select(.online == false) | .givenName + " (" + (.ipAddresses[0] // "no-ip") + ")"] | join(", ")') | first) ~ ". Execution: " ~ execution.id ~ "."} | toJson }}
 
         - id: log_offline_warning
           type: io.kestra.plugin.core.log.Log
-          message: "Offline nodes detected: {{ outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select(.online == false) | .name] | join(\", \")') | first }}."
+          message: "Offline nodes detected: {{ outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select(.online == false) | .name] | join(\", \")') | first }}."
 
       "EXPIRED_NODES_CRITICAL":
         - id: alert_expired_nodes_slack
           type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
           url: "{{ secret('SLACK_WEBHOOK') }}"
           payload: |
-            {{ {"text": "Headscale Tailnet CRITICAL on " ~ inputs.headscale_host ~ ":" ~ inputs.headscale_port ~ ". Machine key expiring within " ~ inputs.days_to_expiry_threshold ~ " day(s): " ~ (outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select((.expiry != null and .expiry != \"\" and .expiry != \"0001-01-01T00:00:00Z\") and (((.expiry | fromdateiso8601) - now) / 86400) < ' ~ inputs.days_to_expiry_threshold ~ ') | .givenName + \" (expires: \" + .expiry + \")\"] | join(\", \")') | first) ~ ". Immediate re-authentication required. Execution: " ~ execution.id ~ "."} | toJson }}
+            {{ {"text": "Headscale Tailnet CRITICAL on " ~ inputs.headscale_host ~ ":" ~ inputs.headscale_port ~ ". Machine key expiring within " ~ inputs.days_to_expiry_threshold ~ " day(s): " ~ (outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select((.expiry != null and .expiry != "" and .expiry != "0001-01-01T00:00:00Z") and (((.expiry[0:19] + "Z" | fromdateiso8601) - now) / 86400) < ' ~ inputs.days_to_expiry_threshold ~ ') | .givenName + " (expires: " + .expiry + ")"] | join(", ")') | first) ~ ". Immediate re-authentication required. Execution: " ~ execution.id ~ "."} | toJson }}
 
       "PROBE_FAILED":
         - id: alert_probe_failed_slack
@@ -131,10 +131,10 @@ tasks:
     description: Exports structured telemetry attributes and tailnet node metrics for compliance records.
     values:
       tailnet_status: "{{ outputs.classify_tailnet_status.value }}"
-      total_nodes: "{{ outputs.probe_headscale_nodes.body | json | jq('.nodes | length') | first ?? 0 }}"
-      online_nodes_count: "{{ outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select(.online == true)] | length') | first ?? 0 }}"
-      offline_nodes_count: "{{ outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select(.online == false)] | length') | first ?? 0 }}"
-      expiring_nodes_count: "{{ outputs.probe_headscale_nodes.body | json | jq('[.nodes[]? | select((.expiry != null and .expiry != \"\" and .expiry != \"0001-01-01T00:00:00Z\") and (((.expiry | fromdateiso8601) - now) / 86400) < ' ~ inputs.days_to_expiry_threshold ~ ')] | length') | first ?? 0 }}"
+      total_nodes: "{{ outputs.probe_headscale_nodes.body | jq('.nodes | length') | first ?? 0 }}"
+      online_nodes_count: "{{ outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select(.online == true)] | length') | first ?? 0 }}"
+      offline_nodes_count: "{{ outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select(.online == false)] | length') | first ?? 0 }}"
+      expiring_nodes_count: "{{ outputs.probe_headscale_nodes.body | jq('[.nodes[]? | select((.expiry != null and .expiry != \"\" and .expiry != \"0001-01-01T00:00:00Z\") and (((.expiry[0:19] + \"Z\" | fromdateiso8601) - now) / 86400) < ' ~ inputs.days_to_expiry_threshold ~ ')] | length') | first ?? 0 }}"
 
 errors:
   - id: alert_flow_error
